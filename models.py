@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from ot_module import OTTemporalAlign
+from mult_module import MulTFusionModel
 
 class FeatureEncoder(nn.Module):
     """
@@ -100,33 +101,20 @@ class ConcatFusionModel(nn.Module):
         return out
 
 
-class CrossAttentionFusionModel(nn.Module):
+class CrossAttentionFusionModel(MulTFusionModel):
     """
-    Baseline Cross-Attention (Kiểu MulT).
+    Baseline Cross-Attention: MulT — Multimodal Transformer for Unaligned
+    Multimodal Language Sequences (Tsai et al., ACL 2019, arXiv:1906.00295).
+    Ported to the bimodal (audio + visual) case in `mult_module.py` — see đó
+    để biết chi tiết kiến trúc (crossmodal attention 2 chiều + self-attention
+    "memory" transformer + residual classifier head, đúng theo code gốc).
     """
-    def __init__(self, audio_dim, visual_dim, hidden_dim, num_classes):
-        super().__init__()
-        self.audio_enc = FeatureEncoder(audio_dim, hidden_dim)
-        self.visual_enc = FeatureEncoder(visual_dim, hidden_dim)
-        
-        self.cross_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(hidden_dim, num_classes)
-        )
-        
-    def forward(self, audio, visual):
-        feat_a = self.audio_enc(audio)
-        feat_v = self.visual_enc(visual)
-        
-        # Query là audio, Key/Value là visual
-        attn_out, _ = self.cross_attn(query=feat_a, key=feat_v, value=feat_v)
-        
-        fused = torch.cat([feat_a, attn_out], dim=-1)
-        pooled = torch.mean(fused, dim=1)
-        
-        out = self.classifier(pooled)
-        return out
+    def __init__(self, audio_dim, visual_dim, hidden_dim, num_classes,
+                 num_heads=4, layers=4, mem_layers=3, attn_dropout=0.1,
+                 relu_dropout=0.1, res_dropout=0.1, embed_dropout=0.1,
+                 out_dropout=0.1, attn_mask=False):
+        super().__init__(audio_dim, visual_dim, hidden_dim, num_classes,
+                          num_heads=num_heads, layers=layers, mem_layers=mem_layers,
+                          attn_dropout=attn_dropout, relu_dropout=relu_dropout,
+                          res_dropout=res_dropout, embed_dropout=embed_dropout,
+                          out_dropout=out_dropout, attn_mask=attn_mask)
