@@ -7,24 +7,38 @@ import os
 from dataset import AudioVisualDataset, collate_fn
 from models import OTFusionModel, GRACEFusionModel, ConcatFusionModel, CrossAttentionFusionModel
 from train import eval_epoch
+from utils import load_model, checkpoint_exists
 
-def run_ablation():
+def run_ablation(checkpoint_dir='checkpoints'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Bắt đầu chạy Ablation Study trên: {device}")
-    
+
     # 1. Chuẩn bị dataset (Chỉ cần validation/test set cho phần ablation)
     val_dataset = AudioVisualDataset(split='test', num_samples=500)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
     criterion = nn.CrossEntropyLoss()
-    
-    # 2. Khởi tạo các pre-trained models (Giả định đã load checkpoint)
-    # Thực tế bạn cần thêm logic load state_dict tại đây
-    models = {
-        'OT_Fusion (Ours)': OTFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4, beta=1.0).to(device),
-        'GRACE (beta=0)': GRACEFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4).to(device),
-        'Concat': ConcatFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4).to(device),
-        'Cross-Attention': CrossAttentionFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4).to(device)
+
+    # 2. Khởi tạo model rồi load checkpoint tốt nhất đã train (bằng train.py --model <key>).
+    # Nếu chưa train model nào đó (chưa có file trong checkpoints/), cảnh báo và dùng
+    # trọng số khởi tạo ngẫu nhiên — kết quả cột đó trong CSV sẽ không có ý nghĩa so sánh.
+    model_specs = {
+        'OT_Fusion (Ours)': ('ot_fusion', OTFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4, beta=1.0)),
+        'GRACE (beta=0)': ('grace', GRACEFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
+        'Concat': ('concat', ConcatFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
+        'Cross-Attention': ('cross_attn', CrossAttentionFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
     }
+
+    models = {}
+    for display_name, (ckpt_name, model) in model_specs.items():
+        model = model.to(device)
+        if checkpoint_exists(ckpt_name, save_dir=checkpoint_dir):
+            model = load_model(model, ckpt_name, save_dir=checkpoint_dir, device=device)
+            print(f"[{display_name}] Đã load checkpoint: {checkpoint_dir}/{ckpt_name}.pt")
+        else:
+            print(f"[{display_name}] CẢNH BÁO: chưa có checkpoint '{ckpt_name}.pt' — "
+                  f"chạy 'python train.py --model {ckpt_name}' trước. Dùng tạm trọng số random.")
+        model.eval()
+        models[display_name] = model
     
     # Các mức độ desync muốn test (Shift N frames)
     # 0 = đồng bộ, dương = visual trễ, âm = visual sớm

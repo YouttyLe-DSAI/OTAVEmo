@@ -4,34 +4,36 @@ import numpy as np
 
 def simulate_desync(visual_features, shift_frames=0):
     """
-    Giả lập desynchronization bằng cách shift visual features.
-    
+    Giả lập desynchronization bằng cách shift visual features theo chiều thời gian.
+
     Args:
-        visual_features (Tensor): Tensor có shape (seq_len, feature_dim)
-        shift_frames (int): Số lượng frame muốn shift. 
+        visual_features (Tensor): shape (seq_len, feature_dim) HOẶC batch
+                                   (batch_size, seq_len, feature_dim) — hàm tự
+                                   nhận diện qua số chiều (ndim) của tensor.
+        shift_frames (int): Số lượng frame muốn shift.
                             Nếu > 0: visual đi chậm hơn audio (shift phải, padding trái).
                             Nếu < 0: visual đi nhanh hơn audio (shift trái, padding phải).
-                            
+
     Returns:
-        shifted_visual (Tensor): Tensor cùng shape nhưng đã bị shift.
+        shifted_visual (Tensor): Tensor cùng shape nhưng đã bị shift theo chiều seq_len.
     """
     if shift_frames == 0:
         return visual_features
-        
-    seq_len, feature_dim = visual_features.shape
+
+    seq_len = visual_features.shape[-2]
     shifted = torch.zeros_like(visual_features)
-    
+
     if shift_frames > 0:
         # Visual chậm hơn: các frame từ 0 đến seq_len-shift_frames sẽ được đẩy sang phải
         if shift_frames < seq_len:
-            shifted[shift_frames:, :] = visual_features[:-shift_frames, :]
+            shifted[..., shift_frames:, :] = visual_features[..., :-shift_frames, :]
         # Phần trống bên trái mặc định là zeros (có thể thay đổi padding strategy nếu cần)
     else:
         # Visual nhanh hơn: các frame từ -shift_frames đến cuối sẽ được đẩy sang trái
         shift = abs(shift_frames)
         if shift < seq_len:
-            shifted[:-shift, :] = visual_features[shift:, :]
-            
+            shifted[..., :-shift, :] = visual_features[..., shift:, :]
+
     return shifted
 
 class AudioVisualDataset(Dataset):
