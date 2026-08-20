@@ -4,7 +4,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from dataset import AudioVisualDataset, collate_fn, simulate_desync
-from models import OTFusionModel, GRACEFusionModel, ConcatFusionModel, CrossAttentionFusionModel
+from models import build_model, count_params, MODEL_KEYS
 from utils import set_seed, save_model, load_model
 import argparse
 
@@ -17,6 +17,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, desync_frames=0
     for batch in dataloader:
         audio = batch['audio'].to(device)
         visual = batch['visual'].to(device)
+        audio_mask = batch['audio_mask'].to(device)
+        visual_mask = batch['visual_mask'].to(device)
         labels = batch['label'].to(device)
 
         # Áp dụng desync nếu cần
@@ -24,7 +26,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, desync_frames=0
             visual = simulate_desync(visual, desync_frames)
 
         optimizer.zero_grad()
-        outputs = model(audio, visual)
+        outputs = model(audio, visual, audio_mask, visual_mask)
         loss = criterion(outputs, labels)
 
         loss.backward()
@@ -51,13 +53,15 @@ def eval_epoch(model, dataloader, criterion, device, desync_frames=0):
         for batch in dataloader:
             audio = batch['audio'].to(device)
             visual = batch['visual'].to(device)
+            audio_mask = batch['audio_mask'].to(device)
+            visual_mask = batch['visual_mask'].to(device)
             labels = batch['label'].to(device)
-            
+
             # Áp dụng desync khi test độ bền (robustness)
             if desync_frames != 0:
                 visual = simulate_desync(visual, desync_frames)
-                
-            outputs = model(audio, visual)
+
+            outputs = model(audio, visual, audio_mask, visual_mask)
             loss = criterion(outputs, labels)
             
             total_loss += loss.item()
@@ -70,14 +74,20 @@ def eval_epoch(model, dataloader, criterion, device, desync_frames=0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='ot_fusion', choices=['ot_fusion', 'grace', 'concat', 'cross_attn'])
+    parser.add_argument('--model', type=str, default='ot_fusion', choices=list(MODEL_KEYS))
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--desync_frames', type=int, default=0, help="Số frame bị lệch khi train/test")
     parser.add_argument('--beta', type=float, default=1.0, help="Trọng số temporal distance cho OT")
+    parser.add_argument('--hidden_dim', type=int, default=128, help="hidden_dim cho OT/GRACE/Concat")
+    parser.add_argument('--mult_hidden_dim', type=int, default=64,
+                        help="hidden_dim riêng cho MulT — nhỏ hơn để CÂN số tham số "
+                             "(MulT phình theo d^2; d=64/layers=3 ~699K, cân với ~625K)")
+    parser.add_argument('--mult_layers', type=int, default=3, help="Số layer crossmodal + memory của MulT")
     # Các hyperparameter pipeline (phỏng theo main.py/train.py gốc của MulT)
-    parser.add_argument('--optim', type=str, default='Adam', help="Optimizer (Adam, SGD, ...)")
+    parser.add_argument('--optim', type=str, default='Adam',
+                        choices=['Adam', 'AdamW', 'SGD', 'RMSprop'], help="Optimizer")
     parser.add_argument('--clip', type=float, default=0.8, help="Gradient clipping norm (0 = tắt)")
     parser.add_argument('--lr_patience', type=int, default=5, help="Số epoch val loss không giảm trước khi decay LR (ReduceLROnPlateau)")
     parser.add_argument('--seed', type=int, default=1111, help="Random seed cho reproducibility")
@@ -100,14 +110,9 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
     # Khởi tạo model
-    if args.model == 'ot_fusion':
-        model = OTFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4, beta=args.beta)
-    elif args.model == 'grace':
-        model = GRACEFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)
-    elif args.model == 'concat':
-        model = ConcatFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)
-    elif args.model == 'cross_attn':
-        model = CrossAttentionFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)
+    model = build_model(args.model, hidden_dim=args.hidden_dim, beta=args.beta,
+                        mult_hidden_dim=args.mult_hidden_dim, mult_layers=args.mult_layers)
+    print(f"Số tham số học được: {count_params(model):,}")
 
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()

@@ -88,8 +88,14 @@ class MultiheadAttention(nn.Module):
             nn.init.constant_(self.in_proj_bias, 0.)
             nn.init.constant_(self.out_proj.bias, 0.)
 
-    def forward(self, query, key, value, attn_mask=None):
-        """query/key/value: (seq_len, batch, embed_dim)."""
+    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None):
+        """query/key/value: (seq_len, batch, embed_dim).
+
+        `key_padding_mask` (batch, src_len) bool, True = vị trí HỢP LỆ, is an
+        addition on top of the official port: the original MulT feeds
+        uniformly-padded batches, whereas this project batches sequences whose
+        lengths differ by orders of magnitude. When it is None the computation
+        is bit-for-bit the original."""
         qkv_same = query.data_ptr() == key.data_ptr() == value.data_ptr()
         kv_same = key.data_ptr() == value.data_ptr()
 
@@ -117,6 +123,14 @@ class MultiheadAttention(nn.Module):
 
         if attn_mask is not None:
             attn_weights += attn_mask.unsqueeze(0)
+
+        if key_padding_mask is not None:
+            # (bsz, src_len) -> (bsz, 1, 1, src_len) -> gộp vào chiều head
+            invalid = ~key_padding_mask.to(torch.bool)
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.masked_fill(
+                invalid.view(bsz, 1, 1, src_len), float('-inf'))
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(attn_weights)
         attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)
@@ -183,18 +197,21 @@ class TransformerEncoderLayer(nn.Module):
         self.fc2 = Linear(4 * embed_dim, embed_dim)
         self.layer_norms = nn.ModuleList([nn.LayerNorm(embed_dim) for _ in range(2)])
 
-    def forward(self, x, x_k=None, x_v=None):
+    def forward(self, x, x_k=None, x_v=None, key_padding_mask=None):
         """x: (seq_len, batch, embed_dim). If x_k/x_v given, does crossmodal
-        attention (query=x, key=value=x_k/x_v); otherwise self-attention."""
+        attention (query=x, key=value=x_k/x_v); otherwise self-attention.
+        `key_padding_mask` (batch, src_len) bool, True = hợp lệ."""
         residual = x
         x = self.layer_norms[0](x)
         mask = buffered_future_mask(x.size(0), (x_k if x_k is not None else x).size(0), x.device) if self.attn_mask else None
         if x_k is None and x_v is None:
-            x, _ = self.self_attn(query=x, key=x, value=x, attn_mask=mask)
+            x, _ = self.self_attn(query=x, key=x, value=x, attn_mask=mask,
+                                  key_padding_mask=key_padding_mask)
         else:
             x_k = self.layer_norms[0](x_k)
             x_v = self.layer_norms[0](x_v)
-            x, _ = self.self_attn(query=x, key=x_k, value=x_v, attn_mask=mask)
+            x, _ = self.self_attn(query=x, key=x_k, value=x_v, attn_mask=mask,
+                                  key_padding_mask=key_padding_mask)
         x = F.dropout(x, p=self.res_dropout, training=self.training)
         x = residual + x
 
@@ -229,8 +246,9 @@ class TransformerEncoder(nn.Module):
         ])
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x_in, x_in_k=None, x_in_v=None):
-        """x_in[_k/_v]: (seq_len, batch, embed_dim). Returns (seq_len, batch, embed_dim)."""
+    def forward(self, x_in, x_in_k=None, x_in_v=None, key_padding_mask=None):
+        """x_in[_k/_v]: (seq_len, batch, embed_dim). Returns (seq_len, batch, embed_dim).
+        `key_padding_mask` (batch, src_len) bool ứng với NGUỒN key/value."""
         x = self.embed_scale * x_in
         x = x + self.embed_positions(x_in.size(0)).unsqueeze(1).type_as(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
@@ -243,9 +261,9 @@ class TransformerEncoder(nn.Module):
 
         for layer in self.layers:
             if x_in_k is not None and x_in_v is not None:
-                x = layer(x, x_k, x_v)
+                x = layer(x, x_k, x_v, key_padding_mask=key_padding_mask)
             else:
-                x = layer(x)
+                x = layer(x, key_padding_mask=key_padding_mask)
 
         return self.layer_norm(x)
 
@@ -295,25 +313,41 @@ class MulTFusionModel(nn.Module):
         self.proj2 = nn.Linear(combined_dim, combined_dim)
         self.out_layer = nn.Linear(combined_dim, num_classes)
 
-    def forward(self, audio, visual):
+    @staticmethod
+    def _last_valid(h, mask):
+        """h: (seq_len, B, d), mask: (B, seq_len) bool True=hợp lệ -> (B, d).
+
+        Bản gốc lấy thẳng `h[-1]`. Với batch mà độ dài chênh nhau hàng chục lần
+        (DFEW: 11 -> 847 frame), `h[-1]` của clip ngắn rơi đúng vào vùng padding,
+        nên phải lấy bước HỢP LỆ cuối cùng của từng mẫu."""
+        if mask is None:
+            return h[-1]
+        idx = mask.to(torch.long).sum(dim=1).clamp(min=1) - 1          # (B,)
+        h = h.transpose(0, 1)                                          # (B, seq_len, d)
+        return h.gather(1, idx.view(-1, 1, 1).expand(-1, 1, h.size(-1))).squeeze(1)
+
+    def forward(self, audio, visual, audio_mask=None, visual_mask=None):
         """
         Args:
             audio (Tensor): (B, seq_len_a, audio_dim)
             visual (Tensor): (B, seq_len_v, visual_dim)
+            audio_mask (Tensor|None): (B, seq_len_a) bool, True = hợp lệ
+            visual_mask (Tensor|None): (B, seq_len_v) bool
         """
         # Conv1d expects (B, channels, seq_len)
         x_a = self.proj_a(audio.transpose(1, 2)).permute(2, 0, 1)   # (seq_len_a, B, d)
         x_v = self.proj_v(visual.transpose(1, 2)).permute(2, 0, 1)  # (seq_len_v, B, d)
 
-        # (V) --> A , (A) --> V
-        h_a_with_v = self.trans_a_with_v(x_a, x_v, x_v)
-        h_v_with_a = self.trans_v_with_a(x_v, x_a, x_a)
+        # (V) --> A , (A) --> V   — key/value đến từ luồng KIA nên mask cũng vậy
+        h_a_with_v = self.trans_a_with_v(x_a, x_v, x_v, key_padding_mask=visual_mask)
+        h_v_with_a = self.trans_v_with_a(x_v, x_a, x_a, key_padding_mask=audio_mask)
 
-        h_a = self.trans_a_mem(h_a_with_v)
-        h_v = self.trans_v_mem(h_v_with_a)
+        # self-attention: key/value là chính nó
+        h_a = self.trans_a_mem(h_a_with_v, key_padding_mask=audio_mask)
+        h_v = self.trans_v_mem(h_v_with_a, key_padding_mask=visual_mask)
 
-        last_h_a = h_a[-1]  # (B, d) — last timestep, as in the official code
-        last_h_v = h_v[-1]
+        last_h_a = self._last_valid(h_a, audio_mask)   # (B, d)
+        last_h_v = self._last_valid(h_v, visual_mask)
 
         last_hs = torch.cat([last_h_a, last_h_v], dim=1)  # (B, 2d)
 

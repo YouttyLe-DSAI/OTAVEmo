@@ -5,11 +5,12 @@ import csv
 import os
 
 from dataset import AudioVisualDataset, collate_fn
-from models import OTFusionModel, GRACEFusionModel, ConcatFusionModel, CrossAttentionFusionModel
+from models import build_model, count_params
 from train import eval_epoch
 from utils import load_model, checkpoint_exists
 
-def run_ablation(checkpoint_dir='checkpoints'):
+def run_ablation(checkpoint_dir='checkpoints', beta=1.0, hidden_dim=128,
+                 mult_hidden_dim=64, mult_layers=3):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Bắt đầu chạy Ablation Study trên: {device}")
 
@@ -18,28 +19,38 @@ def run_ablation(checkpoint_dir='checkpoints'):
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn)
     criterion = nn.CrossEntropyLoss()
 
-    # 2. Khởi tạo model rồi load checkpoint tốt nhất đã train (bằng train.py --model <key>).
-    # Nếu chưa train model nào đó (chưa có file trong checkpoints/), cảnh báo và dùng
-    # trọng số khởi tạo ngẫu nhiên — kết quả cột đó trong CSV sẽ không có ý nghĩa so sánh.
-    model_specs = {
-        'OT_Fusion (Ours)': ('ot_fusion', OTFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4, beta=1.0)),
-        'GRACE (beta=0)': ('grace', GRACEFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
-        'Concat': ('concat', ConcatFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
-        'Cross-Attention': ('cross_attn', CrossAttentionFusionModel(audio_dim=768, visual_dim=256, hidden_dim=128, num_classes=4)),
+    # 2. Khởi tạo model qua build_model (CÙNG cấu hình với train.py) rồi load
+    # checkpoint tốt nhất. Thiếu checkpoint thì DỪNG HẲN — chạy tiếp với trọng số
+    # ngẫu nhiên sẽ tạo ra bảng số trông như thật nhưng vô nghĩa.
+    display_of = {
+        'ot_fusion': 'OT_Fusion (Ours)',
+        'grace': 'GRACE (beta=0)',
+        'concat': 'Concat',
+        'cross_attn': 'Cross-Attention',
     }
 
-    models = {}
-    for display_name, (ckpt_name, model) in model_specs.items():
-        model = model.to(device)
-        if checkpoint_exists(ckpt_name, save_dir=checkpoint_dir):
-            model = load_model(model, ckpt_name, save_dir=checkpoint_dir, device=device)
-            print(f"[{display_name}] Đã load checkpoint: {checkpoint_dir}/{ckpt_name}.pt")
-        else:
-            print(f"[{display_name}] CẢNH BÁO: chưa có checkpoint '{ckpt_name}.pt' — "
-                  f"chạy 'python train.py --model {ckpt_name}' trước. Dùng tạm trọng số random.")
+    models, n_params = {}, {}
+    missing = [k for k in display_of if not checkpoint_exists(k, save_dir=checkpoint_dir)]
+    if missing:
+        raise FileNotFoundError(
+            "Thiếu checkpoint cho: " + ", ".join(missing) + ".\n"
+            "Chạy trước: " + "  ".join(f"python train.py --model {k}" for k in missing))
+
+    for ckpt_name, display_name in display_of.items():
+        model = build_model(ckpt_name, hidden_dim=hidden_dim, beta=beta,
+                            mult_hidden_dim=mult_hidden_dim, mult_layers=mult_layers).to(device)
+        n_params[display_name] = count_params(model)
+        model = load_model(model, ckpt_name, save_dir=checkpoint_dir, device=device)
+        print(f"[{display_name}] checkpoint OK — {n_params[display_name]:,} tham số")
         model.eval()
         models[display_name] = model
-    
+
+    # Cảnh báo nếu số tham số lệch nhau quá nhiều -> so sánh không công bằng
+    lo, hi = min(n_params.values()), max(n_params.values())
+    if hi / lo > 1.5:
+        print(f"\n⚠ CẢNH BÁO: số tham số lệch {hi/lo:.1f}x giữa các model "
+              f"({lo:,} .. {hi:,}). Kết quả so sánh sẽ bị phản biện.\n")
+
     # Các mức độ desync muốn test (Shift N frames)
     # 0 = đồng bộ, dương = visual trễ, âm = visual sớm
     desync_levels = [-30, -20, -10, 0, 10, 20, 30] 
@@ -51,9 +62,11 @@ def run_ablation(checkpoint_dir='checkpoints'):
     with open(csv_file, mode='w', newline='') as file:
         writer = csv.writer(file)
         
-        # Ghi header
+        # Ghi header + số tham số của từng model (để bảng kết quả tự chứng minh
+        # so sánh công bằng, không phải tin lời)
         header = ['Desync_Frames'] + list(models.keys())
         writer.writerow(header)
+        writer.writerow(['n_params'] + [n_params[k] for k in models])
         
         # 3. Chạy đánh giá
         for shift in desync_levels:
