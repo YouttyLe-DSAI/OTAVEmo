@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
-def simulate_desync(visual_features, shift_frames=0):
+def simulate_desync(visual_features, shift_frames=0, mask=None):
     """
     Giả lập desynchronization bằng cách shift visual features theo chiều thời gian.
 
@@ -13,28 +13,45 @@ def simulate_desync(visual_features, shift_frames=0):
         shift_frames (int): Số lượng frame muốn shift.
                             Nếu > 0: visual đi chậm hơn audio (shift phải, padding trái).
                             Nếu < 0: visual đi nhanh hơn audio (shift trái, padding phải).
+        mask (Tensor|None): (..., seq_len) bool, True = vị trí có dữ liệu thật.
 
     Returns:
-        shifted_visual (Tensor): Tensor cùng shape nhưng đã bị shift theo chiều seq_len.
+        shifted_visual (Tensor) nếu mask=None,
+        ngược lại (shifted_visual, shifted_mask).
+
+    Mask PHẢI được shift cùng, nếu không vùng padding mới sinh ra sẽ bị coi là
+    dữ liệu hợp lệ còn phần dữ liệu bị đẩy ra sẽ bị coi là padding — đúng bằng
+    `|shift_frames|` ô sai ở mỗi đầu.
     """
     if shift_frames == 0:
-        return visual_features
+        return visual_features if mask is None else (visual_features, mask)
 
     seq_len = visual_features.shape[-2]
     shifted = torch.zeros_like(visual_features)
+    shifted_mask = torch.zeros_like(mask) if mask is not None else None
 
     if shift_frames > 0:
         # Visual chậm hơn: các frame từ 0 đến seq_len-shift_frames sẽ được đẩy sang phải
         if shift_frames < seq_len:
             shifted[..., shift_frames:, :] = visual_features[..., :-shift_frames, :]
+            if shifted_mask is not None:
+                shifted_mask[..., shift_frames:] = mask[..., :-shift_frames]
         # Phần trống bên trái mặc định là zeros (có thể thay đổi padding strategy nếu cần)
     else:
         # Visual nhanh hơn: các frame từ -shift_frames đến cuối sẽ được đẩy sang trái
         shift = abs(shift_frames)
         if shift < seq_len:
             shifted[..., :-shift, :] = visual_features[..., shift:, :]
+            if shifted_mask is not None:
+                shifted_mask[..., :-shift] = mask[..., shift:]
 
-    return shifted
+    if mask is None:
+        return shifted
+    # Mọi mẫu phải còn ít nhất 1 bước hợp lệ, nếu không Sinkhorn/pooling chia cho 0
+    empty = ~shifted_mask.any(dim=-1)
+    if empty.any():
+        shifted_mask[empty, 0] = True
+    return shifted, shifted_mask
 
 class AudioVisualDataset(Dataset):
     """

@@ -21,9 +21,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device, desync_frames=0
         visual_mask = batch['visual_mask'].to(device)
         labels = batch['label'].to(device)
 
-        # Áp dụng desync nếu cần
+        # Áp dụng desync nếu cần (mask phải shift cùng)
         if desync_frames != 0:
-            visual = simulate_desync(visual, desync_frames)
+            visual, visual_mask = simulate_desync(visual, desync_frames, visual_mask)
 
         optimizer.zero_grad()
         outputs = model(audio, visual, audio_mask, visual_mask)
@@ -57,9 +57,9 @@ def eval_epoch(model, dataloader, criterion, device, desync_frames=0):
             visual_mask = batch['visual_mask'].to(device)
             labels = batch['label'].to(device)
 
-            # Áp dụng desync khi test độ bền (robustness)
+            # Áp dụng desync khi test độ bền (robustness) — mask shift cùng
             if desync_frames != 0:
-                visual = simulate_desync(visual, desync_frames)
+                visual, visual_mask = simulate_desync(visual, desync_frames, visual_mask)
 
             outputs = model(audio, visual, audio_mask, visual_mask)
             loss = criterion(outputs, labels)
