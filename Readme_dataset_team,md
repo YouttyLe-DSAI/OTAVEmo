@@ -1,0 +1,86 @@
+# README — Xử lý dataset DFEW / MAFW (đọc file này trước khi làm gì cả)
+
+File này dành riêng cho phần xử lý dataset. Việc của bạn: từ raw video của
+DFEW và MAFW, xuất ra feature audio + visual đúng 1 format cố định, để pipeline
+train (đã viết sẵn, đã test) đọc thẳng được — không cần biết code train hoạt
+động thế nào, cũng không cần đụng vào phần đó.
+
+## Bạn cần tạo ra gì
+
+Với mỗi dataset (DFEW và MAFW làm riêng), 1 thư mục theo đúng cấu trúc:
+
+```
+<dataset_root>/                  # ví dụ: data/mafw/  hoặc  data/dfew/
+├── audio/
+│   ├── <clip_id>.pt              # tensor (T_a, D_a), float32
+│   └── ...
+├── visual/
+│   ├── <clip_id>.pt              # tensor (T_v, D_v), float32
+│   └── ...
+├── labels.csv                     # clip_id,label,fold
+└── meta.json                       # num_classes, class_names, audio_dim, visual_dim, ...
+```
+
+Đọc chi tiết đầy đủ (bắt buộc, đừng bỏ qua) ở `docs/FEATURE_CONTRACT.md` — file
+đó có mọi quy tắc chính xác: dtype, cách map `fold`, thứ tự `class_names` của
+DFEW/MAFW, v.v. README này chỉ tóm tắt để bạn hình dung nhanh, không thay thế
+được file contract.
+
+## 5 điểm dễ sai nhất (đọc kỹ)
+
+1. **`class_names` trong `meta.json` phải đúng thứ tự index dùng trong cột
+   `label`** — lấy nguyên thứ tự từ file nhãn gốc của DFEW/MAFW khi tải về,
+   không tự sắp lại theo alphabet hay theo trí nhớ. Sai chỗ này = toàn bộ nhãn
+   bị lệch mà không có lỗi nào báo cả.
+2. **`clip_id` phải khớp chính xác** giữa 3 chỗ: tên file `.pt` (không đuôi mở
+   rộng), cột `clip_id` trong `labels.csv`, và ID gốc trong file nhãn chính
+   thức của dataset.
+3. **`T` (số frame) tự do theo từng clip** — không cần pad cho bằng nhau,
+   không cần cắt cho khớp giữa audio và visual. `D` (feature dim) thì phải cố
+   định trong toàn bộ `audio/` (và tương tự `visual/`).
+4. **`fold`**: số nguyên 1–5, map theo split 5-fold chính thức của dataset
+   (với DFEW: clip nằm trong `single_testset_k.csv` gốc → `fold=k`).
+5. Không NaN / Inf trong tensor, `dtype` phải là `float32`.
+
+## Cách tự kiểm tra trước khi báo "xong"
+
+**Bắt buộc chạy lệnh này trước khi báo với mọi người là đã xong phần của
+mình:**
+
+```bash
+python docs/check_dataset_format.py <đường_dẫn_đến_dataset_root_của_bạn>
+```
+
+Ví dụ: `python docs/check_dataset_format.py data/mafw`
+
+- Nếu thấy dòng cuối `RESULT: PASS - an toan de train` → xong, báo lại là
+  được, có thể bàn giao.
+- Nếu thấy `RESULT: FAIL` → đọc từng dòng `[FAIL]` phía trên, nó chỉ thẳng
+  chỗ sai (thiếu file nào, sai shape/dtype ở clip nào, label/fold ngoài
+  range...). Sửa xong chạy lại cho đến khi PASS.
+
+Muốn kiểm tra kỹ toàn bộ (mặc định script chỉ sample 200 clip cho nhanh):
+
+```bash
+python docs/check_dataset_format.py <đường_dẫn> --full
+```
+
+**Đừng tự viết lại hay sửa `check_dataset_format.py`** — cả nhóm dùng chung
+đúng 1 bản trong `docs/` để không ai tự kiểm theo tiêu chuẩn riêng.
+
+## Checklist trước khi báo "xong"
+
+- [ ] Đã đọc `docs/FEATURE_CONTRACT.md` đầy đủ, không chỉ đọc README này
+- [ ] `class_names` trong `meta.json` đã đối chiếu với file nhãn gốc, không
+      phải suy đoán
+- [ ] Mọi `clip_id` trong `labels.csv` đều có đủ file trong `audio/` và `visual/`
+- [ ] Chạy `check_dataset_format.py` và thấy `PASS`
+- [ ] Đã nhắn lại nhóm kèm đường dẫn thư mục dataset đã xong
+
+## Vướng gì thì hỏi trước, đừng tự đoán
+
+Nếu format có gì mơ hồ hoặc raw data không như mong đợi (thiếu audio track,
+clip lỗi, không rõ nên trích bao nhiêu frame...), hỏi trong nhóm trước khi tự
+quyết định — vì 3 người xuất feature theo 3 tiêu chuẩn khác nhau là lỗi tốn
+thời gian nhất để phát hiện và sửa (thường chỉ lộ ra lúc train, không lộ lúc
+`check_dataset_format.py`).
